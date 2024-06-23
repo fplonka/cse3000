@@ -1,0 +1,698 @@
+# RP
+
+```elixir
+Mix.install([
+  {:kino_explorer, "~> 0.1.11"},
+  {:explorer, "~> 0.8.0"},
+  {:kino, "~> 0.12.0"},
+  {:kino_vega_lite, "~> 0.1.10"}
+])
+```
+
+## Setup
+
+```elixir
+alias Explorer.DataFrame
+alias Explorer.Series
+require DataFrame, as: DF
+```
+
+Read the datasets. These are simplified in that only the useful columns were preserved. The datasets were created as follows:
+
+* papers: Semantic Scholar papers dataset, filtered to those where a majorify of the "s2fieldsofstudy" fields were "Computer Science", then filtered to a random 10% subset
+* citations: Semantic Scholar citations dataset, filtered to those citations where either the citing or cited paper id is one we have in the papers dataset
+  The filtering and downloading was done with a separate Go program.
+
+```elixir
+papersSimpleFile = "/Users/filip/Code/rp/rdataprep/datasets/papers/all_cs_papers_simple.ndjson"
+
+citationsSimpleFile =
+  "/Users/filip/Code/rp/rdataprep/datasets/citations/all_citations_simple2.ndjson"
+
+abstractsSimpleFile =
+  "/Users/filip/Code/rp/rdataprep/datasets/abstracts_parallel/all_abstracts_simple_dedup.ndjson"
+```
+
+```elixir
+papers =
+  DF.from_ndjson!(papersSimpleFile)
+  |> DF.drop_nil("authorIds")
+```
+
+```elixir
+citations = DF.from_ndjson!(citationsSimpleFile)
+```
+
+```elixir
+# abstractsSimpleFile
+abstracts = DF.from_ndjson!(abstractsSimpleFile)
+```
+
+```elixir
+authors =
+  DF.from_ndjson!(
+    "/Users/filip/Code/rp/rdataprep/datasets/authors_parallel/all_authors_simple2.ndjson"
+  )
+```
+
+```elixir
+# authors |>
+test =
+  papers
+  |> DF.explode("authorIds")
+  |> DF.group_by("authorIds")
+  |> DF.summarise(cnt: count(authorIds))
+  |> DF.pull("cnt")
+  |> Series.median()
+```
+
+## Experiments
+
+```elixir
+citations
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## Most cited papers
+
+```elixir
+cited_counts =
+  citations
+  |> DF.group_by(["citedcorpusid"])
+  |> DF.summarise(count: count(citingcorpusid))
+  |> DF.rename(citedcorpusid: "corpusid")
+  |> DF.join(papers)
+  |> DF.sort_by(desc: count)
+```
+
+```elixir
+DF.from_ndjson!("/Users/filip/Code/rp/rdataprep/datasets/topic_embeddings.ndjson")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Most cited authors
+
+```elixir
+authorToPapers =
+  papers
+  |> DF.explode("authorIds")
+  |> DF.group_by("authorIds")
+  |> DF.summarise(papers: corpusid)
+
+# |> DF.rename(authorIds: "authorid")
+# |> DF.select(["authorid"])
+# |> DF.rename(authorid: "corpusid")
+```
+
+```elixir
+# authors with most papers
+papers
+|> DF.explode("authorIds")
+|> DF.group_by("authorIds")
+|> DF.summarise(counts: count(corpusid))
+|> DF.sort_by(desc: counts)
+```
+
+```elixir
+authorCitationSums =
+  papers
+  |> DF.explode("authorIds")
+  |> DF.group_by("authorIds")
+  |> DF.select(["corpusid", "citationcount"])
+  |> DF.summarise(citation_sum: sum(citationcount))
+  |> DF.sort_by(desc: citation_sum)
+
+threshold =
+  authorCitationSums
+  |> DF.to_series()
+  |> Map.get("citation_sum")
+  |> Series.quantile(0.999)
+
+superstarIds =
+  authorCitationSums
+  |> DF.filter(citation_sum > ^threshold)
+  |> DF.rename(authorIds: "authorid")
+  |> DF.select(["authorid"])
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## w4 experiments
+
+```elixir
+defmodule Entropy do
+  def compute_entropy(list) do
+    list
+    # Filter out zero probabilities
+    |> Enum.filter(&(&1 > 0))
+    # Compute entropy components
+    |> Enum.map(fn p -> -p * :math.log(p) / :math.log(2) end)
+    # Sum the components to get the entropy
+    |> Enum.sum()
+  end
+end
+
+topicVectors =
+  DF.from_ndjson!(
+    "/Users/filip/Code/rp/rdataprep/datasets/embeddings_parallel/all_embeddings_simple2.ndjson"
+  )
+  |> DF.rename(corpusid: "paperid")
+  |> DF.rename(vector: "topic_embedding")
+
+topicVectors |> DF.print()
+
+IO.puts("vectors loaded")
+
+# topicVectors =
+#   DF.from_ndjson!("/Users/filip/Code/rp/rdataprep/datasets/topic_embeddings.ndjson")
+#   |> DF.rename(corpusid: "paperid")
+
+# TODO: surely can do this faster
+paperEntropies =
+  topicVectors
+  |> DF.put(
+    :entropy,
+    Series.transform(DF.pull(topicVectors, "topic_embedding"), &Entropy.compute_entropy/1)
+  )
+  |> DF.select(["paperid", "entropy"])
+
+paperEntropies
+|> DF.rename(paperid: "corpusid")
+|> DF.rename(entropy: "metric")
+|> DF.to_csv!("/Users/filip/Code/rp/rdataprep/w9/metrics/entropies_specter.csv")
+```
+
+```elixir
+threshold = authors |> DF.pull("hindex") |> Series.quantile(0.999)
+
+getAuthorMeanEnt = fn papers ->
+  papers
+  |> DF.explode("authorIds")
+  |> DF.group_by("authorIds")
+  |> DF.summarise(papers: corpusid)
+  |> DF.rename(authorIds: "authorid")
+  |> DF.join(authors)
+  |> DF.explode("papers")
+  |> DF.rename(papers: "paperid")
+  |> DF.join(paperEntropies)
+  |> DF.group_by("authorid")
+  |> DF.summarise(mean_entropy: mean(entropy))
+end
+
+authorEntropies = getAuthorMeanEnt.(papers)
+
+authorsWithEntropies =
+  authors
+  |> DF.select(["authorid", "hindex", "name"])
+  |> DF.join(authorEntropies)
+```
+
+```elixir
+superstarsWithEntropies = authorsWithEntropies |> DF.filter(hindex > ^threshold)
+normiesWithEntropies = authorsWithEntropies |> DF.filter(hindex <= ^threshold)
+
+superstarsWithEntropies
+|> DF.rename(mean_entropy: "mean_metric")
+|> DF.select(["mean_metric"])
+|> DF.to_ndjson!("/Users/filip/Code/rp/rdataprep/w5/ss_entropy_specter.ndjson")
+
+normiesWithEntropies
+|> DF.rename(mean_entropy: "mean_metric")
+|> DF.select(["mean_metric"])
+|> DF.to_ndjson!("/Users/filip/Code/rp/rdataprep/w5/ns_entropy_specter.ndjson")
+
+# /Users/filip/Code/rp/rdataprep/w5/ss_cit_diversity_specter.ndjson
+
+# nil
+```
+
+```elixir
+plotEntDist = fn
+  df ->
+    mean = df |> DF.pull("mean_entropy") |> Series.mean()
+    IO.puts("mean is #{mean}")
+
+    VegaLite.new(width: 800, height: 600)
+    |> VegaLite.layers([
+      VegaLite.new()
+      |> VegaLite.data_from_values(df, only: ["mean_entropy"])
+      |> VegaLite.mark(:bar)
+      |> VegaLite.encode_field(:x, "mean_entropy",
+        type: :quantitative,
+        bin: [maxbins: 30]
+        # scale: [domain: [0, 4]]
+      )
+      |> VegaLite.encode(:y, aggregate: :count),
+
+      # Add a vertical rule at x = 2
+      VegaLite.new()
+      # Data point for the rule
+      |> VegaLite.data_from_values([%{x: mean}])
+      |> VegaLite.mark(:rule)
+      |> VegaLite.encode_field(:x, "x", type: :quantitative)
+      # Optional: Set the thickness of the rule
+      |> VegaLite.encode(:size, value: 2)
+      # Optional: Set the color of the rule
+      |> VegaLite.encode(:color, value: "red")
+    ])
+end
+```
+
+```elixir
+IO.puts("plotting non-superstar entropy distribution")
+plotEntDist.(normiesWithEntropies)
+```
+
+```elixir
+IO.puts("plotting superstar entropy distribution")
+plotEntDist.(superstarsWithEntropies)
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0Ijo2MDAsImxheWVycyI6W3siYWN0aXZlIjp0cnVlLCJjaGFydF90eXBlIjoiYmFyIiwiY29sb3JfZmllbGQiOm51bGwsImNvbG9yX2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwiY29sb3JfZmllbGRfYmluIjpudWxsLCJjb2xvcl9maWVsZF9zY2FsZV9zY2hlbWUiOm51bGwsImNvbG9yX2ZpZWxkX3R5cGUiOm51bGwsImRhdGFfdmFyaWFibGUiOiJhdXRob3JzIiwiZ2VvZGF0YV9jb2xvciI6ImJsdWUiLCJsYXRpdHVkZV9maWVsZCI6bnVsbCwibG9uZ2l0dWRlX2ZpZWxkIjpudWxsLCJ4X2ZpZWxkIjoiaGluZGV4IiwieF9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInhfZmllbGRfYmluIjo4MCwieF9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ4X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUiLCJ5X2ZpZWxkIjoiX19jb3VudF9fIiwieV9maWVsZF9hZ2dyZWdhdGUiOm51bGwsInlfZmllbGRfYmluIjpudWxsLCJ5X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInlfZmllbGRfdHlwZSI6bnVsbH1dLCJ2bF9hbGlhcyI6IkVsaXhpci5WZWdhTGl0ZSIsIndpZHRoIjo4MDB9","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new(width: 800, height: 600)
+|> VegaLite.data_from_values(authors, only: ["hindex"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "hindex", type: :quantitative, bin: [maxbins: 80])
+|> VegaLite.encode(:y, aggregate: :count)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## w5 experiments
+
+Calculating reference / citation diversity for each paper. Ended up doing the actual computations in Polars....
+
+```elixir
+defmodule Metrics do
+  def compute_metrics(metrics_path, papers, authors) do
+    metrics = DF.from_ndjson!(metrics_path)
+
+    # Calculate mean metric for authors
+    authors_with_mean_metric =
+      papers
+      |> DF.explode("authorIds")
+      |> DF.group_by("authorIds")
+      |> DF.summarise(papers: corpusid)
+      |> DF.rename(authorIds: "authorid")
+      |> DF.join(authors)
+      |> DF.explode("papers")
+      |> DF.rename(papers: "paperid")
+      |> DF.join(metrics, on: [{"paperid", "corpusid"}])
+      |> DF.group_by("authorid")
+      |> DF.summarise(mean_metric: mean(metric))
+      |> DF.join(authors |> DF.select(["authorid", "hindex"]))
+
+    threshold = authors |> DF.pull("hindex") |> Series.quantile(0.999)
+
+    non_superstar_metrics = authors_with_mean_metric |> DF.filter(hindex < ^threshold)
+    superstar_metrics = authors_with_mean_metric |> DF.filter(hindex >= ^threshold)
+
+    {non_superstar_metrics, superstar_metrics}
+  end
+
+  def metric_mean(metric_df) do
+    metric_df |> DF.pull("mean_metric") |> Series.mean()
+  end
+end
+```
+
+```elixir
+{ns_ref_diversity, ss_ref_diversity} =
+  Metrics.compute_metrics(
+    "/Users/filip/Code/rp/rdataprep/datasets/papersipaperspapers
+    papers.ndjson",
+    papers,
+    authors
+  )
+
+{ns_cit_diversity, ss_cit_diversity} =
+  Metrics.compute_metrics(
+    "/Users/filip/Code/rp/rdataprep/datasets/cit_diversity_alt.ndjson",
+    papers,
+    authors
+  )
+
+nil
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0Ijo2MDAsImxheWVycyI6W3siYWN0aXZlIjp0cnVlLCJjaGFydF90eXBlIjoiYmFyIiwiY29sb3JfZmllbGQiOm51bGwsImNvbG9yX2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwiY29sb3JfZmllbGRfYmluIjpudWxsLCJjb2xvcl9maWVsZF9zY2FsZV9zY2hlbWUiOm51bGwsImNvbG9yX2ZpZWxkX3R5cGUiOm51bGwsImRhdGFfdmFyaWFibGUiOiJuc19yZWZfZGl2ZXJzaXR5IiwiZ2VvZGF0YV9jb2xvciI6ImJsdWUiLCJsYXRpdHVkZV9maWVsZCI6bnVsbCwibG9uZ2l0dWRlX2ZpZWxkIjpudWxsLCJ4X2ZpZWxkIjoibWVhbl9tZXRyaWMiLCJ4X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieF9maWVsZF9iaW4iOjgwLCJ4X2ZpZWxkX3NjYWxlX3R5cGUiOm51bGwsInhfZmllbGRfdHlwZSI6InF1YW50aXRhdGl2ZSIsInlfZmllbGQiOiJfX2NvdW50X18iLCJ5X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieV9maWVsZF9iaW4iOm51bGwsInlfZmllbGRfc2NhbGVfdHlwZSI6bnVsbCwieV9maWVsZF90eXBlIjpudWxsfV0sInZsX2FsaWFzIjoiRWxpeGlyLlZlZ2FMaXRlIiwid2lkdGgiOjgwMH0","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new(width: 800, height: 600)
+|> VegaLite.data_from_values(ns_ref_diversity, only: ["mean_metric"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "mean_metric", type: :quantitative, bin: [maxbins: 80])
+|> VegaLite.encode(:y, aggregate: :count)
+```
+
+```elixir
+Metrics.metric_mean(ns_ref_diversity) |> IO.puts()
+Metrics.metric_mean(ss_ref_diversity) |> IO.puts()
+
+nil
+```
+
+```elixir
+DF.to_ndjson!(
+  ns_ref_diversity,
+  "/Users/filip/Code/rp/rdataprep/w5/ns_ref_diversity_specter.ndjson"
+)
+
+DF.to_ndjson!(
+  ss_ref_diversity,
+  "/Users/filip/Code/rp/rdataprep/w5/ss_ref_diversity_specter.ndjson"
+)
+
+DF.to_ndjson!(
+  ns_cit_diversity,
+  "/Users/filip/Code/rp/rdataprep/w5/ns_cit_diversity_specter.ndjson"
+)
+
+DF.to_ndjson!(
+  ss_cit_diversity,
+  "/Users/filip/Code/rp/rdataprep/w5/ss_cit_diversity_specter.ndjson"
+)
+
+ns_ref_diversity
+```
+
+```elixir
+authors |> DF.pull("hindex") |> Series.quantile(0.999)
+# authors
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## W6 experiments
+
+```elixir
+DF.from_csv!("/Users/filip/Code/rp/rdataprep/innovation_scores.csv")
+```
+
+```elixir
+defmodule Metrics do
+  def compute_metrics(metrics_path, papers, authors) do
+    metrics = DF.from_csv!(metrics_path)
+
+    # Calculate mean metric for authors
+    authors_with_mean_metric =
+      papers
+      |> DF.explode("authorIds")
+      |> DF.group_by("authorIds")
+      |> DF.summarise(papers: corpusid)
+      |> DF.rename(authorIds: "authorid")
+      |> DF.join(authors)
+      |> DF.explode("papers")
+      |> DF.rename(papers: "paperid")
+      |> DF.join(metrics, on: [{"paperid", "corpusid"}])
+      |> DF.group_by("authorid")
+      |> DF.summarise(mean_metric: mean(innovation_score))
+      |> DF.join(authors |> DF.select(["authorid", "hindex"]))
+
+    threshold = authors |> DF.pull("hindex") |> Series.quantile(0.999)
+
+    non_superstar_metrics = authors_with_mean_metric |> DF.filter(hindex < ^threshold)
+    superstar_metrics = authors_with_mean_metric |> DF.filter(hindex >= ^threshold)
+
+    {non_superstar_metrics, superstar_metrics}
+  end
+
+  def metric_mean(metric_df) do
+    metric_df |> DF.pull("mean_metric") |> Series.mean()
+  end
+end
+```
+
+```elixir
+{ns_innovation, ss_innovation} =
+  Metrics.compute_metrics(
+    "/Users/filip/Code/rp/rdataprep/innovation_scores.csv",
+    papers,
+    authors
+  )
+
+a = Metrics.metric_mean(ns_innovation)
+b = Metrics.metric_mean(ss_innovation)
+
+b / a
+```
+
+```elixir
+DF.to_ndjson!(
+  ns_innovation,
+  "/Users/filip/Code/rp/rdataprep/w6/ns_innovation.ndjson"
+)
+
+DF.to_ndjson!(
+  ss_innovation,
+  "/Users/filip/Code/rp/rdataprep/w6/ss_innovation.ndjson"
+)
+
+tmp = ns_innovation |> DF.join(authors)
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0Ijo1MDAsImxheWVycyI6W3siYWN0aXZlIjp0cnVlLCJjaGFydF90eXBlIjoicG9pbnQiLCJjb2xvcl9maWVsZCI6bnVsbCwiY29sb3JfZmllbGRfYWdncmVnYXRlIjpudWxsLCJjb2xvcl9maWVsZF9iaW4iOm51bGwsImNvbG9yX2ZpZWxkX3NjYWxlX3NjaGVtZSI6bnVsbCwiY29sb3JfZmllbGRfdHlwZSI6bnVsbCwiZGF0YV92YXJpYWJsZSI6InRtcCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6ImhpbmRleCIsInhfZmllbGRfYWdncmVnYXRlIjpudWxsLCJ4X2ZpZWxkX2JpbiI6bnVsbCwieF9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ4X2ZpZWxkX3R5cGUiOiJxdWFudGl0YXRpdmUiLCJ5X2ZpZWxkIjoibWVhbl9tZXRyaWMiLCJ5X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieV9maWVsZF9iaW4iOm51bGwsInlfZmllbGRfc2NhbGVfdHlwZSI6bnVsbCwieV9maWVsZF90eXBlIjoicXVhbnRpdGF0aXZlIn1dLCJ2bF9hbGlhcyI6IkVsaXhpci5WZWdhTGl0ZSIsIndpZHRoIjo1MDB9","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new(width: 500, height: 500)
+|> VegaLite.data_from_values(tmp, only: ["hindex", "mean_metric"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "hindex", type: :quantitative)
+|> VegaLite.encode_field(:y, "mean_metric", type: :quantitative)
+```
+
+```elixir
+DF.from_csv!("/Users/filip/Code/rp/rdataprep/innovation_scores.csv") |> DF.join(abstracts)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## W7
+
+```elixir
+innovation =
+  DF.from_csv!("/Users/filip/Code/rp/rdataprep/innovation_scores.csv")
+  |> DF.select([:corpusid, :innovation_score])
+
+innovation |> DF.print()
+```
+
+```elixir
+papers
+|> DF.select([:corpusid, :authorIds, :year, :publicationdate, :citationcount])
+|> DF.print()
+```
+
+```elixir
+authors |> DF.select([:authorid, :hindex]) |> DF.print()
+```
+
+```elixir
+exploded = DF.from_csv!("/Users/filip/Code/rp/rdataprep/w7/author_papers_first_5_years.csv")
+```
+
+```elixir
+author_first_pub =
+  DF.from_csv!("/Users/filip/Code/rp/rdataprep/w7/author_first_pub.csv")
+  |> DF.select([:authorid, :first_pub_date])
+```
+
+```elixir
+paperAuthors = papers |> DF.select([:corpusid, :authorIds])
+```
+
+```elixir
+exploded
+|> DF.select([:corpusid, :publicationdate, :citationcount, :innovation_score, :authorid])
+|> DF.join(paperAuthors)
+|> DF.group_by(:authorid)
+|> DF.summarise(paperAuthorLists: authorIds)
+```
+
+```elixir
+# exploded |> groupby(DF.)
+DF.from_csv!("/Users/filip/Code/rp/rdataprep/w7/author_collabs.csv")
+```
+
+```elixir
+threshold = authors |> DF.pull(:hindex) |> Series.quantile(0.999)
+superstars = authors |> DF.filter(hindex >= ^threshold) |> DF.select(:authorid)
+
+superstarPapers =
+  papers
+  |> DF.explode(:authorIds)
+  |> DF.rename(authorIds: "authorid")
+  |> DF.join(superstars)
+```
+
+Find early innovators: first find the authors who cite a superstar in their first five years of papers (these authors can't be early innovators). Then find top 10% innovators. Early innovators are authors in the top 10% who don't appear in the first set.
+
+```elixir
+authors_who_cite_superstars_in_first_five_years =
+  exploded
+  |> DF.join(citations, on: [{:corpusid, :citingcorpusid}])
+  |> DF.group_by(:authorid)
+  |> DF.summarise(citedPapers: citedcorpusid)
+  |> DF.explode(:citedPapers)
+  |> DF.rename(citedPapers: "corpusid")
+  |> DF.join(superstarPapers, on: [{:corpusid, :corpusid}])
+  |> DF.distinct([:authorid])
+
+author_mean_innovations =
+  exploded |> DF.group_by(:authorid) |> DF.summarise(mean_innovation: mean(innovation_score))
+
+innovation_threshold =
+  author_mean_innovations |> DF.pull(:mean_innovation) |> Series.quantile(0.90)
+
+top_10_percent_innovators =
+  author_mean_innovations |> DF.filter(mean_innovation >= ^innovation_threshold)
+
+early_innovators =
+  top_10_percent_innovators
+  |> DF.put(
+    :is_bad,
+    Series.in(
+      top_10_percent_innovators |> DF.pull(:authorid),
+      authors_who_cite_superstars_in_first_five_years |> DF.pull(:authorid)
+    )
+  )
+  |> DF.filter(is_bad == false)
+  |> DF.select([:authorid])
+
+early_innovators |> DF.to_csv("/Users/filip/Code/rp/rdataprep/w7/early_innovator_ids.csv")
+```
+
+```elixir
+citations |> DF.print()
+```
+
+```elixir
+authors
+```
+
+```elixir
+# DF.from_ndjson!("/Users/filip/Code/rp/rdataprep/datasets/topic_embeddings.ndjson") |> DF.print()
+DF.from_ndjson!("/Users/filip/Code/rp/rdataprep/datasets/papers/all_cs_papers_simple.ndjson")
+```
+
+```elixir
+DF.from_csv!("/Users/filip/Code/rp/rdataprep/w8/author_research_diversity.csv")
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## W8
+
+```elixir
+author_diversities_lda =
+  DF.from_csv!("/Users/filip/Code/rp/rdataprep/w8/author_research_diversity_lda.csv")
+  |> DF.rename(authorIds: "authorid", vector: "diversity")
+
+author_diversities_specter =
+  DF.from_csv!("/Users/filip/Code/rp/rdataprep/w8/author_research_diversity_specter.csv")
+  |> DF.rename(authorIds: "authorid", vector: "diversity")
+```
+
+```elixir
+threshold = authors |> DF.pull("hindex") |> Series.quantile(0.999)
+```
+
+```elixir
+joined = authors |> DF.join(author_diversities_lda)
+ss_div = joined |> DF.filter(hindex >= ^threshold)
+ns_div = joined |> DF.filter(hindex < ^threshold)
+
+DF.to_ndjson!(
+  ns_div,
+  "/Users/filip/Code/rp/rdataprep/w8/ns_diversity_lda.ndjson"
+)
+
+DF.to_ndjson!(
+  ss_div,
+  "/Users/filip/Code/rp/rdataprep/w8/ss_diversity_lda.ndjson"
+)
+```
+
+```elixir
+# joined = authors |> DF.join(author_diversities_specter) |> DF.filter(diversity > 0)
+joined = authors |> DF.join(author_diversities_specter)
+ss_div = joined |> DF.filter(hindex >= ^threshold)
+ns_div = joined |> DF.filter(hindex < ^threshold)
+
+DF.to_ndjson!(
+  ns_div,
+  "/Users/filip/Code/rp/rdataprep/w8/ns_diversity_specter.ndjson"
+)
+
+DF.to_ndjson!(
+  ss_div,
+  "/Users/filip/Code/rp/rdataprep/w8/ss_diversity_specter.ndjson"
+)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## W9
+
+```elixir
+author_ss_citation_percentages =
+  DF.from_csv!("/Users/filip/Code/rp/rdataprep/w9/author_ss_citation_percentages.csv")
+```
+
+```elixir
+papers
+|> DF.select(["corpusid", "citationcount"])
+|> DF.rename(citationcount: "metric")
+|> DF.to_csv!("/Users/filip/Code/rp/rdataprep/w9/metrics/citation_counts.csv")
+```
+
+```elixir
+authors
+|> DF.join(author_ss_citation_percentages)
+
+# |> DF.filter(bin == "0.2-0.4")
+```
+
+```elixir
+test = DF.from_csv!("/Users/filip/Code/rp/rdataprep/w9/author_paper_counts.csv")
+```
+
+<!-- livebook:{"attrs":"eyJjaGFydF90aXRsZSI6bnVsbCwiaGVpZ2h0IjpudWxsLCJsYXllcnMiOlt7ImFjdGl2ZSI6dHJ1ZSwiY2hhcnRfdHlwZSI6ImJhciIsImNvbG9yX2ZpZWxkIjpudWxsLCJjb2xvcl9maWVsZF9hZ2dyZWdhdGUiOm51bGwsImNvbG9yX2ZpZWxkX2JpbiI6bnVsbCwiY29sb3JfZmllbGRfc2NhbGVfc2NoZW1lIjpudWxsLCJjb2xvcl9maWVsZF90eXBlIjpudWxsLCJkYXRhX3ZhcmlhYmxlIjoidGVzdCIsImdlb2RhdGFfY29sb3IiOiJibHVlIiwibGF0aXR1ZGVfZmllbGQiOm51bGwsImxvbmdpdHVkZV9maWVsZCI6bnVsbCwieF9maWVsZCI6IjAiLCJ4X2ZpZWxkX2FnZ3JlZ2F0ZSI6bnVsbCwieF9maWVsZF9iaW4iOm51bGwsInhfZmllbGRfc2NhbGVfdHlwZSI6bnVsbCwieF9maWVsZF90eXBlIjoicXVhbnRpdGF0aXZlIiwieV9maWVsZCI6Il9fY291bnRfXyIsInlfZmllbGRfYWdncmVnYXRlIjpudWxsLCJ5X2ZpZWxkX2JpbiI6bnVsbCwieV9maWVsZF9zY2FsZV90eXBlIjpudWxsLCJ5X2ZpZWxkX3R5cGUiOm51bGx9XSwidmxfYWxpYXMiOiJFbGl4aXIuVmVnYUxpdGUiLCJ3aWR0aCI6bnVsbH0","chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(test, only: ["0"])
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "0", type: :quantitative)
+|> VegaLite.encode(:y, aggregate: :count)
+```
+
+```elixir
+threshold = authors |> DF.pull("hindex") |> Series.quantile(0.999)
+
+authors =
+  DF.from_ndjson!(
+    "/Users/filip/Code/rp/rdataprep/datasets/authors_parallel/all_authors_simple2.ndjson"
+  )
+
+innovations = DF.from_csv!("/Users/filip/Code/rp/rdataprep/w9/metrics/innovations.csv")
+
+papers
+|> DF.explode("authorIds")
+|> DF.rename(authorIds: "authorid")
+|> DF.join(authors, on: [{"authorid", "authorid"}])
+# |> DF.filter(hindex > ^threshold)
+|> DF.join(innovations)
+|> DF.distinct(["corpusid"], keep_all: true)
+# |> DF.pull("metric") |> Series.mean()
+|> DF.pull("citationcount")
+|> Series.mean()
+```
+
+```elixir
+authors |> DF.print()
+```

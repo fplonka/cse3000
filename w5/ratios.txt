@@ -1,0 +1,8 @@
+entropy (lda):     1.0543453157306517
+entropy (specter): 1.020848144068178
+
+citation diversity (lda):     1.6718744973958723
+citation diversity (specter): 1.6441032087662697
+
+reference diversity (lda):     1.1379592921795865
+reference diversity (specter): 1.0442916161452656
